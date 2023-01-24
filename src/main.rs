@@ -150,8 +150,9 @@ fn main() {
                 let height = current_instruction & 0xf;
 
                 for (j, row) in (y..y + height as usize).zip(chip8.ri..chip8.ri + height) {
+                    let row = chip8.memory[row as usize];
                     for (i, x) in (0..8).zip(x..x + 8) {
-                        chip8.display[j * WIDTH + x] ^= (row >> (7-i) & 0x1) as u8;
+                        chip8.display[j * WIDTH + x] ^= (row >> (7 - i) & 0x1) as u8;
                     }
                 }
                 draw_tx
