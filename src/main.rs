@@ -86,3 +86,11 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn init_memory() {
+        drop(super::Chip8::new());
+    }
+}
