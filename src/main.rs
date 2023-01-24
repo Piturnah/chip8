@@ -67,11 +67,20 @@ impl Chip8 {
 fn main() {
     let mut chip8 = Chip8::new();
 
-    let (clock_tx, clock_rx) = mpsc::channel();
-
-    // The clock pulses at 60Hz to signal when to decrement the `delay_timer` and `sound_timer`.
-    let _clock = thread::spawn(move || {
+    // The delay clock pulses at 60Hz to signal when to decrement the `delay_timer` and `sound_timer`.
+    let (delay_clock_tx, delay_clock_rx) = mpsc::channel();
+    let _delay_clock = thread::spawn(move || {
         let delay = Duration::from_secs_f64(1.0 / 60.0);
+        loop {
+            thread::sleep(delay);
+            delay_clock_tx.send(()).expect("main thread owns receiver");
+        }
+    });
+
+    // The clock pulses to ensure 700 instructions are FDE'd per second.
+    let (clock_tx, clock_rx) = mpsc::channel();
+    let _clock = thread::spawn(move || {
+        let delay = Duration::from_secs_f64(1.0 / 700.0);
         loop {
             thread::sleep(delay);
             clock_tx.send(()).expect("main thread owns receiver");
@@ -80,9 +89,13 @@ fn main() {
 
     // Event loop
     loop {
-        if clock_rx.try_recv().is_ok() {
+        if delay_clock_rx.try_recv().is_ok() {
             chip8.delay_timer = chip8.delay_timer.saturating_sub(1);
-            chip8.delay_timer = chip8.sound_timer.saturating_sub(1);
+            chip8.sound_timer = chip8.sound_timer.saturating_sub(1);
+        }
+
+        if clock_rx.try_recv().is_err() {
+            continue;
         }
     }
 }
