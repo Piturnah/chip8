@@ -1,4 +1,5 @@
 // Reference: <https://tobiasvl.github.io/blog/write-a-chip-8-emulator/>
+use std::{sync::mpsc, thread, time::Duration};
 
 const WIDTH: usize = 64;
 const HEIGHT: usize = 32;
@@ -64,5 +65,24 @@ impl Chip8 {
 }
 
 fn main() {
-    let _ = Chip8::new();
+    let mut chip8 = Chip8::new();
+
+    let (clock_tx, clock_rx) = mpsc::channel();
+
+    // The clock pulses at 60Hz to signal when to decrement the `delay_timer` and `sound_timer`.
+    let _clock = thread::spawn(move || {
+        let delay = Duration::from_secs_f64(1.0 / 60.0);
+        loop {
+            thread::sleep(delay);
+            clock_tx.send(()).expect("main thread owns receiver");
+        }
+    });
+
+    // Event loop
+    loop {
+        if clock_rx.try_recv().is_ok() {
+            chip8.delay_timer = chip8.delay_timer.saturating_sub(1);
+            chip8.delay_timer = chip8.sound_timer.saturating_sub(1);
+        }
+    }
 }
