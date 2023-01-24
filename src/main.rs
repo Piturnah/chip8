@@ -1,4 +1,3 @@
-// Reference: <https://tobiasvl.github.io/blog/write-a-chip-8-emulator/>
 use std::{sync::mpsc, thread, time::Duration};
 
 const WIDTH: usize = 64;
@@ -63,9 +62,24 @@ impl Chip8 {
     }
 }
 
+// To avoid bringing in rand, simple PRNG implementation using LSFR.
+// <https://en.wikipedia.org/wiki/Linear-feedback_shift_register>
+struct Lfsr(u8);
+impl Lfsr {
+    // 10110100
+    fn next(&mut self) -> u8 {
+        let bit = (self.0 >> 7) ^ (self.0 >> 5) ^ (self.0 >> 4) ^ (self.0 >> 2);
+        self.0 = (bit << 7) | (self.0 >> 1);
+        self.0
+    }
+}
+
 fn main() {
     let mut chip8 = Chip8::new();
-    chip8.load_rom(&std::fs::read("IBM_Logo.ch8").unwrap());
+    chip8.load_rom(&std::fs::read("test_opcode.ch8").unwrap());
+
+    const CLEAR: &str = "\x1B[2J\x1B[1;1H";
+    print!("{CLEAR}");
 
     // The delay clock pulses at 60Hz to signal when to decrement the `delay_timer` and `sound_timer`.
     let (delay_clock_tx, delay_clock_rx) = mpsc::channel();
@@ -90,9 +104,11 @@ fn main() {
     let (draw_tx, draw_rx) = mpsc::channel::<Box<[u8; WIDTH * HEIGHT]>>();
     let _draw = thread::spawn(move || {
         use std::io::Write;
-        const CLEAR: &str = "\x1B[2J\x1B[1;1H";
+        const RESET_CURSOR: &str = "\x1B[1;1H";
+        // TODO: Optimisation: if we were too slow and there are multiple frames in the queue, we
+        // only need to render the most recent one and can drop the rest.
         while let Ok(buf) = draw_rx.recv() {
-            print!("{CLEAR}");
+            print!("{RESET_CURSOR}");
             for y in (0..HEIGHT).step_by(2) {
                 for x in 0..WIDTH {
                     print!(
@@ -112,6 +128,8 @@ fn main() {
         }
     });
 
+    let mut prng = Lfsr(0xFF);
+
     // Event loop
     loop {
         if delay_clock_rx.try_recv().is_ok() {
@@ -128,25 +146,124 @@ fn main() {
             + chip8.memory[chip8.pc as usize + 1] as u16;
         chip8.pc += 2;
 
+        /// Index by nibble i from some the current instruction.
+        /// e.g. i=0123
+        ///      0xFFFF
+        macro_rules! nibble {
+            ($i:expr) => {
+                current_instruction as usize >> (4 * (3 - $i)) & 0xf
+            };
+        }
+        macro_rules! rv {
+            (X) => {
+                chip8.rv[nibble!(1)]
+            };
+            (Y) => {
+                chip8.rv[nibble!(2)]
+            };
+        }
+
         // Decode + Execute
         match current_instruction >> 12 & 0xf {
             0x0 => match current_instruction {
                 // Clear screen.
-                0x00e0 => *chip8.display = [0; WIDTH * HEIGHT],
-                _ => unimplemented!("no implementation for {current_instruction:#X?}"),
+                0x00E0 => {
+                    *chip8.display = [0; WIDTH * HEIGHT];
+                    draw_tx
+                        .send(chip8.display.clone())
+                        .expect("rx thread loops forever");
+                }
+                // Return from subroutine.
+                0x00EE => chip8.pc = chip8.stack.pop().expect("returning from no subroutine"),
+                _ => unimplemented!("opcode {current_instruction:#X?}"),
             },
             // Jump to NNN immediate.
             0x1 => chip8.pc = current_instruction & 0x0fff,
+            // Call subroutine at NNN.
+            0x2 => {
+                chip8.stack.push(chip8.pc);
+                chip8.pc = current_instruction & 0x0fff;
+            }
+            // Skip if VX == NN.
+            0x3 => {
+                if chip8.rv[nibble!(1)] == current_instruction as u8 {
+                    chip8.pc += 2;
+                }
+            }
+            // Skip if VX != NN.
+            0x4 => {
+                if chip8.rv[nibble!(1)] != current_instruction as u8 {
+                    chip8.pc += 2;
+                }
+            }
+            // Skip if VX == VY.
+            0x5 => {
+                if chip8.rv[nibble!(1)] == chip8.rv[nibble!(2)] {
+                    chip8.pc += 2;
+                }
+            }
             // Set register VX to NN.
-            0x6 => chip8.rv[(current_instruction >> 8 & 0xf) as usize] = current_instruction as u8,
+            0x6 => chip8.rv[nibble!(1)] = current_instruction as u8,
             // Add to register VX value NN.
-            0x7 => chip8.rv[(current_instruction >> 8 & 0xf) as usize] += current_instruction as u8,
+            0x7 => {
+                let rv = &mut chip8.rv[nibble!(1)];
+                *rv = rv.wrapping_add(current_instruction as u8);
+            }
+            0x8 => match current_instruction & 0xf {
+                // Set VX to VY.
+                0x0 => chip8.rv[nibble!(1)] = chip8.rv[nibble!(2)],
+                // Set VX = VX | VY.
+                0x1 => chip8.rv[nibble!(1)] = chip8.rv[nibble!(1)] | chip8.rv[nibble!(2)],
+                // Set VX = VX & VY.
+                0x2 => chip8.rv[nibble!(1)] = chip8.rv[nibble!(1)] & chip8.rv[nibble!(2)],
+                // Set VX = VX xor VY.
+                0x3 => chip8.rv[nibble!(1)] = chip8.rv[nibble!(1)] ^ chip8.rv[nibble!(2)],
+                // Set VX = VX + VY and set carry in VF.
+                0x4 => {
+                    let v = chip8.rv[nibble!(1)] as u16 + chip8.rv[nibble!(2)] as u16;
+                    chip8.rv[0xF] = if v > 255 { 1 } else { 0 };
+                    chip8.rv[nibble!(1)] = v as u8;
+                }
+                // Set VX = VX - VY and set carry in VF.
+                0x5 => {
+                    chip8.rv[0xF] = if rv!(Y) > rv!(X) { 1 } else { 0 };
+                    rv!(X) = rv!(X).wrapping_sub(rv!(Y));
+                }
+                // VX >>
+                0x6 => {
+                    let x = rv!(X);
+                    rv!(X) = x / 2;
+                    chip8.rv[0xF] = x % 2;
+                }
+                // Set VX = VY - VX and set carry in VF.
+                0x7 => {
+                    chip8.rv[0xF] = if rv!(X) > rv!(Y) { 1 } else { 0 };
+                    rv!(X) = rv!(Y).wrapping_sub(rv!(X));
+                }
+                // VX <<
+                0xE => {
+                    let x = rv!(X);
+                    rv!(X) = x << 1;
+                    chip8.rv[0xF] = if x & 0b1000_0000 > 0 { 1 } else { 0 };
+                }
+                _ => unimplemented!("opcode {current_instruction:#X?}"),
+            },
+            // Skip if VX != VY.
+            0x9 => {
+                if chip8.rv[nibble!(1)] != chip8.rv[nibble!(2)] {
+                    chip8.pc += 2;
+                }
+            }
             // Set RI to NNN.
             0xA => chip8.ri = current_instruction & 0x0fff,
+            // Jump to B0 + NNN.
+            0xB => chip8.pc = chip8.rv[0] as u16 + current_instruction & 0x0fff,
+            // VX = PRNG & NN.
+            0xC => rv!(X) = prng.next() & current_instruction as u8,
             // Draw DXYN.
             0xD => {
-                let x = chip8.rv[(current_instruction >> 8 & 0xf) as usize] as usize % WIDTH;
-                let y = chip8.rv[(current_instruction >> 4 & 0xf) as usize] as usize % HEIGHT;
+                let x = chip8.rv[nibble!(1)] as usize % WIDTH;
+                let y = chip8.rv[nibble!(2)] as usize % HEIGHT;
                 let height = current_instruction & 0xf;
 
                 for (j, row) in (y..y + height as usize).zip(chip8.ri..chip8.ri + height) {
@@ -159,7 +276,13 @@ fn main() {
                     .send(chip8.display.clone())
                     .expect("rx thread loops forever");
             }
-            _ => unimplemented!("no implementation for {current_instruction:#X?}"),
+            0xF => match current_instruction as u8 {
+                0x07 => rv!(X) = chip8.delay_timer,
+                0x15 => chip8.delay_timer = rv!(X),
+                0x18 => chip8.sound_timer = rv!(X),
+                _ => unimplemented!("opcode {current_instruction:#X?}"),
+            },
+            _ => unimplemented!("opcode {current_instruction:#X?}"),
         }
     }
 }
